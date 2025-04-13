@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nfmix"
+version = "0.1.0"
+authors = [
+  { name="Dimitrije Markovic"}
+]
+description = "Exploration of mixture of normalizing flows"
+readme = "README.md"
+license = { file="LICENSE" }
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "zuko",
+    "seaborn",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/dimarkov/nfmix"
+"Bug Tracker" = "https://github.com/dimarkov/nfmix/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nfmix"]
