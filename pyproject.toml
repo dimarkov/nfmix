@@ -27,7 +27,8 @@ dependencies = [
     "seaborn",
     "pyro-ppl",
     "torch-geometric",
-    "torch-scatter" # Often required by torch-geometric
+    "torch-scatter"
+    "ivon-opt"
 ]
 
 [project.optional-dependencies]
@@ -36,7 +37,7 @@ dev = [
     "ruff",
     "pre-commit",
     "ipykernel",
-    "ipywidgets" # For running notebooks
+    "ipywidgets"
     # Add other dev tools if needed
 ]
 
