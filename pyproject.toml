@@ -25,6 +25,19 @@ dependencies = [
     "torchaudio",
     "zuko",
     "seaborn",
+    "pyro-ppl",
+    "torch-geometric",
+    "torch-scatter" # Often required by torch-geometric
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "pre-commit",
+    "ipykernel",
+    "ipywidgets" # For running notebooks
+    # Add other dev tools if needed
 ]
 
 [project.urls]
@@ -32,4 +45,4 @@ dependencies = [
 "Bug Tracker" = "https://github.com/dimarkov/nfmix/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["nfmix"]
+packages = ["src/nfmix"]
