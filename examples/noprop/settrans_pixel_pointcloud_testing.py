@@ -453,7 +453,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="mnist", choices=["mnist"])
     parser.add_argument("--data-root", default="./data")
-    parser.add_argument("--backbone", default="none")
     parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=512)
