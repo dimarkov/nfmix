@@ -28,7 +28,8 @@ dependencies = [
     "pyro-ppl",
     "torch-geometric",
     "torch-scatter",
-    "ivon-opt"
+    "ivon-opt",
+    "einops"
 ]
 
 [project.optional-dependencies]
