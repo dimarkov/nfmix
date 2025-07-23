@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
 from einops import rearrange, repeat
+import matplotlib.pyplot as plt
 
 import torch_optimizer
 import ivon
@@ -188,28 +189,11 @@ class SetTransformer(nn.Module):
         return x
 
 
-def feature_chamfer_loss(pred, target):
-    pos_weight = 1.0
-    feat_weight = 0.5
-
-    pos_dist = torch.cdist(pred[..., :2], target[..., :2])
-
-    feat_dist = torch.cdist(pred[..., 2:], target[..., 2:])
-
-    comb_dist = pos_weight * pos_dist + feat_weight * feat_dist
-
-    min_dist_pred, _ = torch.min(comb_dist, dim=2)
-    min_dist_target, _ = torch.min(comb_dist, dim=1)
-
-    return 0.5 * (min_dist_pred.sum(-1) + min_dist_target.sum(-1))
-
-
-def optim_sched(model, datasize, hess_init, num_epochs):
-    datasize = 1000 * datasize
+def optim_sched(model, datasize, hess_init, weight_decay, num_epochs):
     optimizer = ivon.IVON(
         model.parameters(),
         lr=1e-2,
-        weight_decay=1 / datasize,
+        weight_decay=weight_decay,
         hess_init=hess_init,
         ess=datasize,
     )
@@ -217,25 +201,22 @@ def optim_sched(model, datasize, hess_init, num_epochs):
         optimizer,
         warmup_epochs=num_epochs // 5,
         max_epochs=num_epochs,
-        warmup_start_lr=1e-4,
-        eta_min=1e-5,
+        warmup_start_lr=1e-3,
+        eta_min=1e-4,
     )
     return optimizer, scheduler
 
 
-def evaluate_acc(model, x, y, num_classes, compute_loss, device, num_samples=1):
-    x = x.repeat(num_classes, 1, 1)
-    y_ = (
-        torch.arange(num_classes, device=device)
-        .view(-1, 1)
-        .repeat(1, y.size(0))
-        .flatten()
-    )
-    elbo = 0.0
-    for _ in range(num_samples):
-        elbo -= compute_loss(model, x, y_, device).detach()
-    elbo = elbo / num_samples
-    pred = elbo.reshape(num_classes, y.size(0)).argmax(dim=0)
+def evaluate_acc(model, x, y, num_classes, device, num_samples=1, η: float = 1.0):
+    elbos = []
+    for c in torch.arange(num_classes, device=device):
+        elbo = 0.0
+        for _ in range(num_samples):
+            elbo -= compute_loss(
+                model, x, c.repeat(x.size(0)), device, η, add_noise=False
+            ).detach()
+        elbos.append(elbo / num_samples)
+    pred = torch.stack(elbos).argmax(dim=0)
     num_correct = (pred == y).sum().item()
     return num_correct
 
@@ -347,7 +328,6 @@ class NoPropSetTransformerFlow(nn.Module):
     def __init__(
         self,
         dim,
-        queries_dim,
         num_classes,
         embed_dim=256,
         time_emb_dim=64,
@@ -357,11 +337,12 @@ class NoPropSetTransformerFlow(nn.Module):
         set_trans_inducing_points=4,
         flow_type="maf",
         flow_transforms=1,
+        flow_dim=None,
         num_seeds=2,
+        mixture_components=1,
     ):
         super().__init__()
         self.dim = dim
-        self.queries_dim = queries_dim
         self.z_shape = (num_seeds, embed_dim)
 
         self.positional_encoding = GaussianPositionalEncoding(dim)
@@ -386,11 +367,26 @@ class NoPropSetTransformerFlow(nn.Module):
 
         self.fuse = FuseHead(embed_dim * num_seeds)
 
+        if mixture_components > 1:
+            self.prior_c = ZEncoder(z_dim, mixture_components)
+            mdim = max(mixture_components, embed_dim)
+            gaus = torch.randn(mdim, mdim)
+            svd = torch.linalg.svd(gaus)
+            orth = svd[0] @ svd[2]
+            self.components_embedding = nn.Parameter(
+                orth[:mixture_components, :embed_dim]
+            )
+        else:
+            self.prior_c = None
+
+        if flow_dim is None:
+            flow_dim = embed_dim
+
         self.flow_decoder = self.build_flow(
             features=dim + 2,
             context=embed_dim,
             flow_type=flow_type,
-            hidden_features=(embed_dim, embed_dim),
+            hidden_features=(flow_dim, flow_dim),
             transforms=flow_transforms,
         )
 
@@ -440,17 +436,69 @@ class NoPropSetTransformerFlow(nn.Module):
 
         return self.fuse(y_emb, z_t, t_emb).view(*z_t.shape)
 
-    def make_context(self, y, z_t):
+    def make_context(self, y, z_t, with_prior=False):
         comb = torch.cat([z_t, self.label_enc[y]], dim=-1)
-        return self.z_encoder(comb.view(y.size(0), -1))
+        if with_prior:
+            return self.z_encoder(comb.view(y.size(0), -1)), self.prior_c(
+                comb.view(y.size(0), -1)
+            )
+        else:
+            return self.z_encoder(comb.view(y.size(0), -1))
 
-    def loss_ce(self, x, y, z_t, t):
+    def _loss_ce(self, x, y, z_t):
         context = self.make_context(y, z_t)
         return -self.flow_decoder(context).log_prob(x.moveaxis(0, 1)).sum(dim=0)
 
+    def mixture_loss_ce(self, x, y, z_t):
+        context, logits = self.make_context(y, z_t, with_prior=True)
+
+        k = logits.shape[-1]  # number of components
+        n, s, _ = x.shape
+
+        # _cntxt = context.repeat(k, 1)
+        _x = x.repeat(k, 1, 1)
+        # _comp = self.components_embedding.view(k, 1, -1).repeat(1, n, 1).view(n * k, -1)
+
+        c = context + self.components_embedding.view(
+            k, 1, -1
+        )  # torch.cat([_cntxt, _comp], dim=-1)
+        log_prob = (
+            self.flow_decoder(c.view(n * k, -1))
+            .log_prob(_x.moveaxis(0, 1))
+            .view(s, k, n)
+            .mT
+        )
+        return -torch.logsumexp(log_prob + logits, dim=-1).sum(
+            dim=0
+        ) + s * torch.logsumexp(logits, dim=-1)
+
+    def loss_ce(self, x, y, z_t):
+        if self.prior_c:
+            return self.mixture_loss_ce(x, y, z_t)
+        else:
+            return self._loss_ce(x, y, z_t)
+
+    def sample(self, y, z_T, num_samples):
+        if self.prior_c:
+            context, logits = self.make_context(y, z_T, with_prior=True)
+            n, k = logits.shape
+            # have to do it sequential because of memory
+            samples = []
+            for _ in range(num_samples):
+                comps = torch.distributions.Categorical(logits=logits).sample()
+                # comps = self.components_embedding[comps]
+                c = context + self.components_embedding[comps]
+                samples.append(self.flow_decoder(c).sample())
+            return torch.stack(samples, dim=1)
+        else:
+            context.model.make_context(y, z_T)
+            return self.flow_decoder(context).sample((num_samples,)).moveaxis(0, 1)
+
 
 # Training and Inference Logic
-def compute_loss(model, x, y, device, η: float = 1.0) -> float:
+def compute_loss(
+    model, x, y, device, η: float = 1.0, add_noise: bool = True, return_loss: int = -1
+) -> float:
     B = x.size(0)
     u_x = model.x_enc(x, y)
     t = torch.rand(B, 1, device=device, requires_grad=True)
@@ -465,8 +513,19 @@ def compute_loss(model, x, y, device, η: float = 1.0) -> float:
     t1 = torch.ones_like(t)
     αb1 = model.alpha_bar(t1).unsqueeze(-1)
     z1 = αb1.sqrt() * u_x + (1 - αb1).sqrt() * torch.randn_like(u_x)
-    loss_ce = model.loss_ce(x, y, z1, t1)
-    loss = loss_ce + loss_kl + loss_sdm
+
+    if add_noise:
+        x = x + 0.05 * torch.randn_like(x)
+    loss_ce = model.loss_ce(x, y, z1)
+
+    if return_loss == -1:
+        loss = loss_ce + loss_kl + loss_sdm
+    elif return_loss == 0:
+        loss = loss_ce
+    elif return_loss == 1:
+        loss = loss_kl
+    elif return_loss == 2:
+        loss = loss_sdm
     return loss
 
 
@@ -497,8 +556,7 @@ def run_noprop_ct_inference_heun(
         z = z + 0.5 * dt * (f_n + f_mid)
 
     z_T = model.forward_u(y, z, torch.ones_like(t_n))
-    context = model.make_context(y, z_T)
-    return model.flow_decoder(context).sample((num_samples,)).moveaxis(0, 1)
+    return model.sample(y, z_T, num_samples)
 
 
 def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -522,6 +580,7 @@ def train_and_eval(
 ):
     print("start")
     # dataset-specific setup
+    patch_size = 1
     if dataset == "mnist":
         ds_train = torchvision.datasets.MNIST(
             data_root,
@@ -546,10 +605,10 @@ def train_and_eval(
             ),
         )
         num_classes = 10
-        queries_dim = 49
-        dim = 16
+        dim = patch_size**2
         image_size = 28
         dataset_size = 60_000
+
     elif dataset == "cifar10":
         # mean, std = (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
         ds_train = torchvision.datasets.CIFAR10(
@@ -577,10 +636,10 @@ def train_and_eval(
             ),
         )
         num_classes = 10
-        queries_dim = 8 * 8
-        dim = 16 * 3
+        dim = 3 * (patch_size**2)
         image_size = 32
         dataset_size = 50_000
+
     elif dataset == "cifar100":
         # mean, std = (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)
         ds_train = torchvision.datasets.CIFAR100(
@@ -610,10 +669,10 @@ def train_and_eval(
             ),
         )
         num_classes = 100
-        queries_dim = 8 * 8
-        dim = 16 * 3
+        dim = 3 * (patch_size**2)
         image_size = 32
         dataset_size = 50_000
+
     else:
         raise ValueError(f"Unsupported dataset '{dataset}'")
 
@@ -625,34 +684,36 @@ def train_and_eval(
     )
     te_loader = DataLoader(ds_test, batch_size=batch_size, shuffle=False, num_workers=8)
 
+    mixc = 16
     model = NoPropSetTransformerFlow(
         dim=dim,
-        queries_dim=queries_dim,
         num_classes=num_classes,
         embed_dim=embed_dim,
         time_emb_dim=time_emb_dim,
         flow_type=flow,
+        flow_transforms=2,
+        flow_dim=32,
+        mixture_components=mixc,
     ).to(device)
 
     if optim == "ivon":
-        optimizer, scheduler = optim_sched(model, dataset_size, 1.0, epoches)
-        train_samples = 2
+        optimizer, scheduler = optim_sched(model, dataset_size, 1.0, 1e-5, epoches)
+        train_samples = 1
 
     elif optim == "lamb":
-        optimizer = torch_optimizer.Lamb(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        optimizer = torch_optimizer.Lamb(model.parameters(), lr=5e-3, weight_decay=1e-4)
         scheduler = None
 
     elif optim == "belief":
         optimizer = torch_optimizer.AdaBelief(
-            model.parameters(), lr=1e-3, weight_decay=1e-3
+            model.parameters(), lr=1e-3, weight_decay=1e-4
         )
         scheduler = None
 
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         scheduler = None
 
-    patch_size = 4
     patch_grid_x, patch_grid_y = torch.meshgrid(
         torch.arange(image_size // patch_size),
         torch.arange(image_size // patch_size),
@@ -662,7 +723,8 @@ def train_and_eval(
         [patch_grid_x.reshape(-1), patch_grid_y.reshape(-1)], dim=-1
     ).to(device)
 
-    num_samples = 16
+    num_samples = 128
+    η = 1.0
 
     print("train start")
     # training loop
@@ -678,30 +740,34 @@ def train_and_eval(
                 image_size=image_size,
                 patch_size=patch_size,
             )
-            x = x + 0.01 * torch.randn_like(x)
             if optim == "ivon":
                 for _ in range(train_samples):
                     with optimizer.sampled_params(train=True):
                         optimizer.zero_grad()
                         total_loss += (
-                            train_step(model, x, y, device) * x.size(0) / train_samples
+                            train_step(model, x, y, device, η)
+                            * x.size(0)
+                            / train_samples
                         )
                 optimizer.step()
             else:
                 optimizer.zero_grad()
-                total_loss += train_step(model, x, y, device) * x.size(0)
+                total_loss += train_step(model, x, y, device, η) * x.size(0)
                 optimizer.step()
 
         scheduler.step() if scheduler is not None else None
-        avg_loss = total_loss / len(ds_train)
-        print(
-            f" Epoch {ep:03d} loss {avg_loss:8.4f} | train {time.time()-t0:3.1f}s",
-            end="",
-        )
 
         if ep % 5 == 0:
+            avg_loss = total_loss / len(ds_train)
+            print()
+            print(
+                f" Epoch {ep:03d} loss {avg_loss:8.4f} | train {time.time()-t0:3.1f}s",
+                end="",
+            )
+
+        if ep % 10 == 0:
             model.eval()
-            corr = tot = acc = 0
+            tot = acc = 0.0
             eval_t0 = time.time()
             for x, y in te_loader:
                 x, y = x.to(device), y.to(device)
@@ -712,18 +778,30 @@ def train_and_eval(
                     image_size=image_size,
                     patch_size=patch_size,
                 )
-                preds = run_noprop_ct_inference_heun(model, y, num_samples, T_steps=40)
-                corr += feature_chamfer_loss(preds, x).sum()
+                preds = run_noprop_ct_inference_heun(model, y, 256, T_steps=20)
                 tot += y.size(0)
                 acc += evaluate_acc(
-                    model, x, y, num_classes, compute_loss, device, num_samples=10
+                    model, x, y, num_classes, device, num_samples=10, η=η
                 )
 
+            fig, axes = plt.subplots(10, 5, figsize=(6, 8), sharex=True, sharey=True)
+
+            for j in range(5):
+                for i in range(10):
+                    x = preds[y == i][j].cpu().numpy()
+                    axes[i, j].hist2d(
+                        x[:, 1], -x[:, 0], bins=28, range=((-1, 1), (-1, 1))
+                    )
+                    axes[i, j].set_yticks([])
+                    axes[i, j].set_xticks([])
+
+            fig.tight_layout()
+            fig.savefig(f"mnist_gen_{ep}_{mixc}.png", dpi=100)
+
             print(
-                f" | ACC {100 * acc/tot:4.2f}% | Error {corr/tot:4.2f} | time {time.time()-eval_t0:3.1f}s",
+                f" | ACC {100 * acc/tot:4.2f}% | time {time.time()-eval_t0:3.1f}s",
                 end="",
             )
-        print()
 
     # cleanup
     del model, optimizer, ds_train, ds_test, tr_loader, te_loader
@@ -738,7 +816,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--data-root", default="./data")
     parser.add_argument("--time-emb-dim", type=int, default=64)
-    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--optimizer", type=str, default="adamw")
