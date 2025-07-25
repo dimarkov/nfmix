@@ -121,36 +121,33 @@ class SAB(nn.Module):
 
 
 class ISAB(nn.Module):
-    def __init__(self, dim, num_classes, heads=8, dim_head=64, num_inducing_points=16):
+    def __init__(self, dim, heads=8, dim_head=64, num_inducing_points=16):
         super().__init__()
-        self.inducing_points = nn.Parameter(
-            torch.randn(num_classes, num_inducing_points, dim)
-        )
+        self.inducing_points = nn.Parameter(torch.randn(num_inducing_points, dim))
         self.mab1 = MAB(dim, heads=heads, dim_head=dim_head)
         self.mab2 = MAB(dim, heads=heads, dim_head=dim_head)
 
-    def forward(self, x, y):
-        h = self.mab1(self.inducing_points[y], x)
+    def forward(self, x):
+        h = self.mab1(self.inducing_points.repeat(x.size(0), 1, 1), x)
         return self.mab2(x, h)
 
 
 class PMA(nn.Module):
-    def __init__(self, dim, num_classes, heads=8, dim_head=64, num_seeds=1):
+    def __init__(self, dim, heads=8, dim_head=64, num_seeds=1):
         super().__init__()
-        self.seeds = nn.Parameter(torch.randn(num_classes, num_seeds, dim))
+        self.seeds = nn.Parameter(torch.randn(num_seeds, dim))
         self.mab = MAB(dim, heads=heads, dim_head=dim_head)
         self.ff = FeedForward(dim)
 
-    def forward(self, x, y):
+    def forward(self, x):
         x = self.ff(x)
-        return self.mab(self.seeds[y], x)
+        return self.mab(self.seeds.repeat(x.size(0), 1, 1), x)
 
 
 class SetTransformer(nn.Module):
     def __init__(
         self,
         *,
-        num_classes,
         dim,
         depth,
         heads,
@@ -163,7 +160,6 @@ class SetTransformer(nn.Module):
             *[
                 ISAB(
                     dim,
-                    num_classes,
                     heads=heads,
                     dim_head=dim_head,
                     num_inducing_points=num_inducing_points,
@@ -172,19 +168,18 @@ class SetTransformer(nn.Module):
             ]
         )
         self.decoder = nn.Sequential(
-            PMA(dim, num_classes, heads=heads, dim_head=dim_head, num_seeds=num_seeds),
+            PMA(dim, heads=heads, dim_head=dim_head, num_seeds=num_seeds),
             SAB(dim, heads=heads, dim_head=dim_head),
             nn.Linear(dim, dim),
             nn.ReLU(),
             nn.LayerNorm(dim),
         )
 
-    def forward(self, x, y):
+    def forward(self, x):
         for enc in self.encoder:
-            x = enc(x, y)
+            x = enc(x)
 
-        x = self.decoder[0](x, y)
-        for dec in self.decoder[1:]:
+        for dec in self.decoder:
             x = dec(x)
         return x
 
@@ -213,10 +208,11 @@ def evaluate_acc(model, x, y, num_classes, device, num_samples=1, η: float = 1.
         elbo = 0.0
         for _ in range(num_samples):
             elbo -= compute_loss(
-                model, x, c.repeat(x.size(0)), device, η, add_noise=False
+                model, x, c.repeat(x.size(0)), device, η, add_noise=False, return_loss=0
             ).detach()
         elbos.append(elbo / num_samples)
-    pred = torch.stack(elbos).argmax(dim=0)
+    elbos = torch.stack(elbos)
+    pred = (elbos - torch.logsumexp(elbos, dim=0)).sum(dim=1).argmax(dim=0)
     num_correct = (pred == y).sum().item()
     return num_correct
 
@@ -303,26 +299,6 @@ class ZEncoder(nn.Module):
         return self.net(z)
 
 
-# ----------------------------------------------------------------------------
-# fuse head to combine image, z, and t features
-# ----------------------------------------------------------------------------
-class FuseHead(nn.Module):
-    def __init__(self, embed_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim * 3, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-
-    def forward(
-        self, fy: torch.Tensor, fz: torch.Tensor, ft: torch.Tensor
-    ) -> torch.Tensor:
-        x = torch.cat([fy, fz, ft], dim=-1)
-        return self.net(x.view(x.size(0), -1))
-
-
 # Main Model: NoPropSetTransformerFlow
 class NoPropSetTransformerFlow(nn.Module):
     def __init__(
@@ -331,6 +307,7 @@ class NoPropSetTransformerFlow(nn.Module):
         num_classes,
         embed_dim=256,
         time_emb_dim=64,
+        pos_emb_dim=32,
         set_trans_depth=2,
         set_trans_heads=8,
         set_trans_dim_head=64,
@@ -345,12 +322,11 @@ class NoPropSetTransformerFlow(nn.Module):
         self.dim = dim
         self.z_shape = (num_seeds, embed_dim)
 
-        self.positional_encoding = GaussianPositionalEncoding(dim)
+        self.positional_encoding = GaussianPositionalEncoding(pos_emb_dim)
 
-        self.embed_data = nn.Linear(2 * dim, embed_dim)
+        self.embed_data = nn.Linear(dim + pos_emb_dim, embed_dim)
 
         self.set_trans = SetTransformer(
-            num_classes=num_classes,
             dim=embed_dim,
             depth=set_trans_depth,
             heads=set_trans_heads,
@@ -362,22 +338,19 @@ class NoPropSetTransformerFlow(nn.Module):
         self.time_enc = TimeEncoder(time_emb_dim, embed_dim)
         self.noise_schedule = NoiseSchedule(hidden_dim=64)
 
-        z_dim = 2 * embed_dim * num_seeds
-        self.z_encoder = ZEncoder(z_dim, embed_dim)
+        z_dim = embed_dim * num_seeds
+        # self.z_encoder = ZEncoder(z_dim, embed_dim)
+        self.context_encoder = ZEncoder(z_dim, embed_dim)
+        self.prior_obj = ZEncoder(z_dim, num_classes)
 
-        self.fuse = FuseHead(embed_dim * num_seeds)
+        self.fuse = ZEncoder((num_seeds + 1) * embed_dim, num_seeds * embed_dim)
 
-        if mixture_components > 1:
-            self.prior_c = ZEncoder(z_dim, mixture_components)
-            mdim = max(mixture_components, embed_dim)
-            gaus = torch.randn(mdim, mdim)
-            svd = torch.linalg.svd(gaus)
-            orth = svd[0] @ svd[2]
-            self.components_embedding = nn.Parameter(
-                orth[:mixture_components, :embed_dim]
-            )
-        else:
-            self.prior_c = None
+        self.prior_comp = ZEncoder(z_dim, mixture_components)
+        mdim = max(mixture_components, embed_dim)
+        gaus = torch.randn(mdim, mdim)
+        svd = torch.linalg.svd(gaus)
+        orth = svd[0] @ svd[2]
+        self.components_embedding = nn.Parameter(orth[:mixture_components, :embed_dim])
 
         if flow_dim is None:
             flow_dim = embed_dim
@@ -390,30 +363,19 @@ class NoPropSetTransformerFlow(nn.Module):
             transforms=flow_transforms,
         )
 
-        self.label_enc = nn.Parameter(
-            torch.randn(num_classes, num_seeds, embed_dim) * 0.01
-        )
-        self.label_enc_u = nn.Parameter(
+        self.label_enc_context = nn.Parameter(
             torch.randn(num_classes, num_seeds, embed_dim) * 0.01
         )
 
+        mdim = max(num_classes, embed_dim)
+        gaus = torch.randn(mdim, mdim)
+        svd = torch.linalg.svd(gaus)
+        orth = svd[0] @ svd[2]
+        self.label_enc_q = nn.Parameter(orth[:num_classes, None, :embed_dim])
+
     def build_flow(self, features, context, flow_type, hidden_features, transforms):
-        if flow_type == "naf":
-            return zuko.flows.NAF(
-                features,
-                context,
-                hidden_features=hidden_features,
-                transforms=transforms,
-            )
-        elif flow_type == "maf":
+        if flow_type == "maf":
             return zuko.flows.MAF(
-                features,
-                context,
-                hidden_features=hidden_features,
-                transforms=transforms,
-            )
-        elif flow_type == "unaf":
-            return zuko.flows.UNAF(
                 features,
                 context,
                 hidden_features=hidden_features,
@@ -425,74 +387,72 @@ class NoPropSetTransformerFlow(nn.Module):
     def alpha_bar(self, t: torch.Tensor) -> torch.Tensor:
         return self.noise_schedule.alpha_bar(t)
 
-    def x_enc(self, data, y):
+    def xy_enc(self, data, y):
         pos_embed = self.positional_encoding(data[..., :2])
         data = self.embed_data(torch.cat([data[..., 2:], pos_embed], dim=-1))
-        return self.set_trans(data, y)
+        data += self.label_enc_q[y]
 
-    def forward_u(self, y, z_t, t):
-        t_emb = self.time_enc(t).unsqueeze(-2).repeat(1, z_t.size(1), 1)
-        y_emb = self.label_enc_u[y]
+        return self.set_trans(data)
 
-        return self.fuse(y_emb, z_t, t_emb).view(*z_t.shape)
+    def forward_u(self, z_t, t):
+        t_emb = self.time_enc(t)
+        x = torch.cat([z_t.view(z_t.size(0), -1), t_emb], dim=-1)
+        return self.fuse(x).view(*z_t.shape)
 
-    def make_context(self, y, z_t, with_prior=False):
-        comb = torch.cat([z_t, self.label_enc[y]], dim=-1)
-        if with_prior:
-            return self.z_encoder(comb.view(y.size(0), -1)), self.prior_c(
-                comb.view(y.size(0), -1)
-            )
-        else:
-            return self.z_encoder(comb.view(y.size(0), -1))
+    # NOTE: Maybe we can improve classification
+    # accuracy by swithcing to p(obj_s|f_s, c_s) p(f_s|c_s) p(c_s) structure for the likeihood.
+    def loss_ce(self, x, y, z_t):
+        comb = (z_t + self.label_enc_context[y]).view(y.size(0), -1)
+        context = self.context_encoder(comb)
+        logits_comps = self.prior_comp(comb)
+        logits_objects = self.prior_obj(z_t.view(z_t.size(0), -1))
 
-    def _loss_ce(self, x, y, z_t):
-        context = self.make_context(y, z_t)
-        return -self.flow_decoder(context).log_prob(x.moveaxis(0, 1)).sum(dim=0)
-
-    def mixture_loss_ce(self, x, y, z_t):
-        context, logits = self.make_context(y, z_t, with_prior=True)
-
-        k = logits.shape[-1]  # number of components
+        k = logits_comps.shape[-1]  # number of components
         n, s, _ = x.shape
 
-        # _cntxt = context.repeat(k, 1)
         _x = x.repeat(k, 1, 1)
-        # _comp = self.components_embedding.view(k, 1, -1).repeat(1, n, 1).view(n * k, -1)
-
-        c = context + self.components_embedding.view(
-            k, 1, -1
-        )  # torch.cat([_cntxt, _comp], dim=-1)
+        c = context + self.components_embedding.view(k, 1, -1)
         log_prob = (
             self.flow_decoder(c.view(n * k, -1))
             .log_prob(_x.moveaxis(0, 1))
             .view(s, k, n)
             .mT
         )
-        return -torch.logsumexp(log_prob + logits, dim=-1).sum(
-            dim=0
-        ) + s * torch.logsumexp(logits, dim=-1)
 
-    def loss_ce(self, x, y, z_t):
-        if self.prior_c:
-            return self.mixture_loss_ce(x, y, z_t)
-        else:
-            return self._loss_ce(x, y, z_t)
+        loss = -torch.logsumexp(log_prob + logits_comps, dim=-1)
+        loss += torch.logsumexp(logits_comps, dim=-1)
+        loss += F.cross_entropy(logits_objects, y)
 
-    def sample(self, y, z_T, num_samples):
-        if self.prior_c:
-            context, logits = self.make_context(y, z_T, with_prior=True)
-            n, k = logits.shape
-            # have to do it sequential because of memory
-            samples = []
-            for _ in range(num_samples):
-                comps = torch.distributions.Categorical(logits=logits).sample()
-                # comps = self.components_embedding[comps]
-                c = context + self.components_embedding[comps]
-                samples.append(self.flow_decoder(c).sample())
-            return torch.stack(samples, dim=1)
+        return loss
+
+    def sample(self, z, num_samples, y=None):
+        if y is None:
+            logits = self.prior_obj(z.view(z.size(0), -1))
+            prior_dist_y = torch.distributions.Categorical(logits=logits)
+            _y = prior_dist_y.sample()
         else:
-            context.model.make_context(y, z_T)
-            return self.flow_decoder(context).sample((num_samples,)).moveaxis(0, 1)
+            _y = y
+            comb = (z + self.label_enc_context[_y]).view(y.size(0), -1)
+            logits_comps = self.prior_comp(comb)
+
+        # have to do it sequentially because of memory
+        samples = []
+        for i in range(num_samples):
+            comb = (
+                (z + self.label_enc_context[_y]).view(y.size(0), -1)
+                if y is None
+                else comb
+            )
+            logits_comps = self.prior_comp(comb) if y is None else logits_comps
+            n, k = logits_comps.shape
+            comps = torch.distributions.Categorical(logits=logits_comps).sample()
+            context = self.context_encoder(comb)
+            c = context + self.components_embedding[comps]
+            samples.append(self.flow_decoder(c).sample())
+            if i < num_samples - 1:
+                _y = prior_dist_y.sample() if y is None else y
+
+        return torch.stack(samples, dim=1)
 
 
 # Training and Inference Logic
@@ -500,31 +460,36 @@ def compute_loss(
     model, x, y, device, η: float = 1.0, add_noise: bool = True, return_loss: int = -1
 ) -> float:
     B = x.size(0)
-    u_x = model.x_enc(x, y)
+    u_xy = model.xy_enc(x, y)
     t = torch.rand(B, 1, device=device, requires_grad=True)
     αb = model.alpha_bar(t).unsqueeze(-1)
     snr = αb / (1 - αb)
     snr_p = torch.autograd.grad(snr.sum(), t, create_graph=True)[0]
-    zt = αb.sqrt() * u_x + (1 - αb).sqrt() * torch.randn_like(u_x)
-    pred_e = model.forward_u(y, zt, t)
-    mse = F.mse_loss(pred_e, u_x, reduction="none").view(B, -1).sum(dim=1, keepdim=True)
+    zt = αb.sqrt() * u_xy + (1 - αb).sqrt() * torch.randn_like(u_xy)
+    pred_e = model.forward_u(zt, t)
+    mse = (
+        F.mse_loss(pred_e, u_xy, reduction="none").view(B, -1).sum(dim=1, keepdim=True)
+    )
     loss_sdm = 0.5 * η * (snr_p * mse).squeeze(-1)
-    loss_kl = 0.5 * (u_x.pow(2).view(B, -1).sum(dim=1))
+    loss_kl = 0.5 * (u_xy.pow(2).view(B, -1).sum(dim=1))
     t1 = torch.ones_like(t)
     αb1 = model.alpha_bar(t1).unsqueeze(-1)
-    z1 = αb1.sqrt() * u_x + (1 - αb1).sqrt() * torch.randn_like(u_x)
+    z1 = αb1.sqrt() * u_xy + (1 - αb1).sqrt() * torch.randn_like(u_xy)
 
     if add_noise:
         x = x + 0.05 * torch.randn_like(x)
     loss_ce = model.loss_ce(x, y, z1)
 
     if return_loss == -1:
-        loss = loss_ce + loss_kl + loss_sdm
+        loss = loss_ce.sum(dim=0) + loss_kl + loss_sdm
     elif return_loss == 0:
-        loss = loss_ce
+        s = x.size(1)
+        loss = loss_ce + (loss_kl + loss_sdm) / s
     elif return_loss == 1:
-        loss = loss_kl
+        loss = loss_ce
     elif return_loss == 2:
+        loss = loss_kl
+    elif return_loss == 3:
         loss = loss_sdm
     return loss
 
@@ -547,16 +512,16 @@ def run_noprop_ct_inference_heun(
         t_n = torch.full((B, 1), i / T_steps, device=y.device)
         t_np1 = torch.full((B, 1), (i + 1) / T_steps, device=y.device)
         αn = model.alpha_bar(t_n).unsqueeze(-1)
-        pred_n = model.forward_u(y, z, t_n)
+        pred_n = model.forward_u(z, t_n)
         f_n = (pred_n - z) / (1 - αn)
         z_mid = z + dt * f_n
         αm = model.alpha_bar(t_np1).unsqueeze(-1)
-        pred_mid = model.forward_u(y, z_mid, t_np1)
+        pred_mid = model.forward_u(z_mid, t_np1)
         f_mid = (pred_mid - z_mid) / (1 - αm)
         z = z + 0.5 * dt * (f_n + f_mid)
 
-    z_T = model.forward_u(y, z, torch.ones_like(t_n))
-    return model.sample(y, z_T, num_samples)
+    z_T = model.forward_u(z, torch.ones_like(t_n))
+    return model.sample(z_T, num_samples, y=y)
 
 
 def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -684,14 +649,14 @@ def train_and_eval(
     )
     te_loader = DataLoader(ds_test, batch_size=batch_size, shuffle=False, num_workers=8)
 
-    mixc = 16
+    mixc = 30
     model = NoPropSetTransformerFlow(
         dim=dim,
         num_classes=num_classes,
         embed_dim=embed_dim,
         time_emb_dim=time_emb_dim,
         flow_type=flow,
-        flow_transforms=2,
+        flow_transforms=3,
         flow_dim=32,
         mixture_components=mixc,
     ).to(device)
@@ -723,7 +688,7 @@ def train_and_eval(
         [patch_grid_x.reshape(-1), patch_grid_y.reshape(-1)], dim=-1
     ).to(device)
 
-    num_samples = 128
+    num_samples = 64
     η = 1.0
 
     print("train start")
@@ -781,7 +746,7 @@ def train_and_eval(
                 preds = run_noprop_ct_inference_heun(model, y, 256, T_steps=20)
                 tot += y.size(0)
                 acc += evaluate_acc(
-                    model, x, y, num_classes, device, num_samples=10, η=η
+                    model, x, y, num_classes, device, num_samples=16, η=η
                 )
 
             fig, axes = plt.subplots(10, 5, figsize=(6, 8), sharex=True, sharey=True)
@@ -818,8 +783,13 @@ if __name__ == "__main__":
     parser.add_argument("--time-emb-dim", type=int, default=64)
     parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--optimizer", type=str, default="adamw")
+    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="lamb",
+        choices=["lamb", "adamw", "ivon", "belief"],
+    )
     parser.add_argument("--flow", type=str, default="maf", choices=["maf"])
     args = parser.parse_args()
 
