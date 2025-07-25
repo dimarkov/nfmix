@@ -240,11 +240,11 @@ class SetTransformer(nn.Module):
         return self.fc(x.view(x.size(0), -1))
 
 
-def optim_sched(model, datasize, hess_init, num_epochs):
+def optim_sched(model, datasize, hess_init, weight_decay, num_epochs):
     optimizer = ivon.IVON(
         model.parameters(),
-        lr=1e-2,
-        weight_decay=1 / datasize,
+        lr=1e-1,
+        weight_decay=weight_decay,
         hess_init=hess_init,
         ess=datasize,
     )
@@ -252,8 +252,8 @@ def optim_sched(model, datasize, hess_init, num_epochs):
         optimizer,
         warmup_epochs=num_epochs // 5,
         max_epochs=num_epochs,
-        warmup_start_lr=1e-3,
-        eta_min=1e-5,
+        warmup_start_lr=1e-2,
+        eta_min=1e-3,
     )
     return optimizer, scheduler
 
@@ -333,7 +333,7 @@ def train_and_eval(
     image_size = 28
     dataset_size = 60_000
     pos_encoding = True
-    num_samples = 256
+    num_samples = 64
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"--- {dataset.upper()} ({num_classes} classes) using {device} ---")
@@ -358,11 +358,11 @@ def train_and_eval(
     ).to(device)
 
     if optim == "ivon":
-        optimizer, scheduler = optim_sched(model, dataset_size, 1.0, epoches)
+        optimizer, scheduler = optim_sched(model, dataset_size, 0.1, 1e-5, epoches)
         train_samples = 1
 
     elif optim == "lamb":
-        optimizer = torch_optimizer.Lamb(model.parameters(), lr=1e-2, weight_decay=1e-2)
+        optimizer = torch_optimizer.Lamb(model.parameters(), lr=1e-3, weight_decay=1e-3)
         scheduler = None
 
     elif optim == "belief":
